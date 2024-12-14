@@ -13,13 +13,15 @@ from tqdm import tqdm
 import argparse
 import os
 
+from unhcv.common.utils import find_path
+
 scheduler = DDIMScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", clip_sample=False, set_alpha_to_one=False)
 MY_TOKEN = ''
 LOW_RESOURCE = False 
-GUIDANCE_SCALE = 1.0
+GUIDANCE_SCALE = 7.5
 MAX_NUM_WORDS = 77
 device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
-ldm_stable = StableDiffusionPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", use_auth_token=MY_TOKEN, scheduler=scheduler).to(device)
+ldm_stable = StableDiffusionPipeline.from_pretrained(find_path("model/stable-diffusion-v1-5"), use_auth_token=MY_TOKEN, scheduler=scheduler, safety_checker=None).to(device)
 
 try:
     ldm_stable.disable_xformers_memory_efficient_attention()
@@ -149,8 +151,10 @@ class ODESolve:
         return text_embeddings
 
     @torch.no_grad()
-    def ddim_loop(self, latent, is_forward=True):
+    def ddim_loop(self, latent, is_forward=True, forward_latents=None, backward_diff=None):
         all_latent = [latent]
+        if forward_latents is not None:
+            backward_diff = []
         latent = latent.clone().detach()
         for i in tqdm(range(self.num_ddim_steps)):
             if is_forward:
@@ -158,8 +162,15 @@ class ODESolve:
             else:
                 t = self.model.scheduler.timesteps[i]
             latent = self.get_noise_pred(latent, t, is_forward, self.context)
+            if forward_latents is not None:
+                backward_diff.append(forward_latents[- i - 2] - latent)
+                latent += backward_diff[-1]
+            elif backward_diff is not None:
+                latent += backward_diff[i]
             all_latent.append(latent)
 
+        if forward_latents is not None:
+            return all_latent, backward_diff
         return all_latent
 
 
@@ -171,10 +182,14 @@ class ODESolve:
         image = self.latent2image(latent)
         cv2.imwrite(img_name, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
 
-    def invert(self, prompt, start_latent, is_forward):
+    def invert(self, prompt, start_latent, is_forward, backward_diff=None):
         self.init_prompt(prompt)
-        latents = self.ddim_loop(start_latent, is_forward=is_forward)
-        return latents[-1]
+        latents = self.ddim_loop(start_latent, is_forward=is_forward, backward_diff=backward_diff)
+        return latents
+
+    def fetch_backward_diff(self, forward_latents):
+        latents, backward_diff = self.ddim_loop(forward_latents[-1], is_forward=False, forward_latents=forward_latents)
+        return latents, backward_diff
 
     def invert_i2n2i(self, prompt1, prompt2, image_start_latent, flip=False):
 
@@ -196,7 +211,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--image_path', type=str, default='./asserts/1.png', help='test image path')
     parser.add_argument('--private_key', type=str, default='Effiel tower', help='text prompt of the private key')
-    parser.add_argument('--public_key', type=str, default='a tree', help='text prompt of the public key')
+    parser.add_argument('--public_key', type=str, default='Effiel tower', help='text prompt of the public key')
     parser.add_argument('--save_path', type=str, default='./output', help='text prompt of the public key')
     parser.add_argument('--num_steps', type=int, default=50, help='sampling step of DDIM')        
     args = parser.parse_args()
@@ -221,13 +236,16 @@ if __name__ == "__main__":
     cv2.imwrite("{:s}/gt.png".format(args.save_path), cv2.cvtColor(image_gt, cv2.COLOR_RGB2BGR))
 
     # hide process
-    latent_noise = ode.invert(prompt_1, image_gt_latent, is_forward=True)
-    image_hide_latent = ode.invert(prompt_2, latent_noise, is_forward=False)
+    all_latent_noise = ode.invert(prompt_1, image_gt_latent, is_forward=True)
+    latents, backward_diff = ode.fetch_backward_diff(all_latent_noise)
+    latent_noise = all_latent_noise[-1]
+    image_hide_latent = ode.invert(prompt_2, latent_noise, is_forward=False, backward_diff=backward_diff)[-1]
 
     # save container image
     image_hide = ode.latent2image(image_hide_latent)
     cv2.imwrite("{:s}/hide.png".format(args.save_path), cv2.cvtColor(image_hide, cv2.COLOR_RGB2BGR))
-    
+    breakpoint()
+
     # reveal process
     image_hide_latent_reveal = ode.image2latent(image_hide)
     latent_noise = ode.invert(rev_prompt_2, image_hide_latent_reveal, is_forward=True)
